@@ -20,6 +20,7 @@ cat("\014")
 #))
 
 #install.packages("intergraph")
+#install.packages("speedglm")
 
 # Se cargan las librerias que serán utilizadas
 library(tidyverse)
@@ -33,7 +34,14 @@ library(scales)
 library(btergm)
 library(network)
 library(sna)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(network)
+library(ergm)
+library(btergm)
 library(intergraph)
+library(speedglm)
 
 # Se define el directorio de forma manual
 setwd("C:/Users/Enzo/OneDrive/Documentos/Trabajo Banco Mundial/proyecto_fenomeno_nino")
@@ -44,259 +52,391 @@ nodos <- read_csv("authors.csv")
 autor_publicacion <- read_csv("author_publication.csv")
 produccion <- read_csv("produccion_cientifica.csv")
 
-# Se realiza una verificación previa
-head(nodos)
-head(autor_publicacion)
-head(produccion)
+# Autores
+nodos <- nodos %>%
+  transmute(
+    name = trimws(as.character(Author_id)),
+    Author_name,
+    Affiliations
+  ) %>%
+  distinct(name, .keep_all = TRUE)
 
-# Se verifica presencia de duplicados
-sum(duplicated(nodos$Author_id))
-sum(duplicated(autor_publicacion))
-sum(duplicated(autor_publicacion[c("EID", "Author_id")]))
 
-# Número de autores
-n_distinct(nodos$Author_id)
+# Relaciones autor-publicación
+autor_publicacion <- autor_publicacion %>%
+  mutate(
+    Author_id = trimws(as.character(Author_id)),
+    EID = trimws(as.character(EID)),
+    Year = as.integer(Year)
+  )
 
-# Número de publicaciones
-n_distinct(autor_publicacion$EID)
 
-# Número de registros autor-publicación
-nrow(autor_publicacion)
+# ============================================================
+# 2. RED BIPARTITA AUTOR–PUBLICACIÓN
+# ============================================================
 
-# Se analiza la cantidad de publicaciones por autor distinto
-autores_por_publicacion <- autor_publicacion %>%
+df_bip_edges <- autor_publicacion %>%
+  filter(
+    !is.na(Author_id),
+    !is.na(EID),
+    !is.na(Year),
+    Year >= 2010,
+    Year <= 2024
+  ) %>%
+  distinct(Author_id, EID, Year)
+
+
+# ============================================================
+# 3. DIAGNÓSTICOS
+# ============================================================
+
+# ¿Un EID aparece asociado a más de un año?
+eid_multiple_years <- df_bip_edges %>%
+  distinct(EID, Year) %>%
+  count(EID, name = "n_years") %>%
+  filter(n_years > 1)
+
+print(eid_multiple_years)
+
+
+# Número de autores por publicación
+autores_por_publicacion <- df_bip_edges %>%
   distinct(EID, Author_id) %>%
   count(EID, name = "n_autores") %>%
   arrange(desc(n_autores))
 
-head(autores_por_publicacion, 20)
-
-# Se cambia el nombre del identificador del objeto nodo por name
-nodos <- nodos %>%
-  transmute(
-    name = as.character(Author_id),
-    Author_name,
-    Affiliations
-  )
-
-# En el dataframe autor_publicacion se cambia el tipo de dato de la columna author_id
-autor_publicacion <- autor_publicacion %>%
-  mutate(Author_id = as.character(Author_id))
-
-############################################################
-# Se construye el dataframe de los enlaces
-############################################################
-
-df_edges_year <- autor_publicacion %>%
-  distinct(EID, Author_id, Year) %>% 
-  group_by(EID, Year) %>% # <- agrupas por Year también
-  filter(n() >= 2) %>%
-  summarise(
-    pares = list(combn(as.character(Author_id), 2, simplify=FALSE)),
-    .groups="drop"
-  ) %>%
-  tidyr::unnest_longer(pares) %>%
-  transmute(
-    Year,
-    from = pmin(purrr::map_chr(pares,1), purrr::map_chr(pares,2)),
-    to   = pmax(purrr::map_chr(pares,1), purrr::map_chr(pares,2))
-  ) %>%
-  count(Year, from, to, name="weight")
-
-# Número de diadas creadas en total
-n_distinct(df_edges_year)
+print(head(autores_por_publicacion, 20))
 
 
-# Ahora si:
-# df_edges_year %>% filter(Year %in% 2010:2012) -> para construir tu edgecov_2013
-# df_edges_year %>% filter(Year >= 2013) -> para tus redes dependientes 2013-2024
+# Número de publicaciones por año
+publicaciones_por_anio <- df_bip_edges %>%
+  distinct(EID, Year) %>%
+  count(Year, name = "n_publicaciones")
 
-faltan <- setdiff(unique(c(df_edges_year$from, df_edges_year$to)), nodos$name)
-length(faltan)
-head(faltan)
+print(publicaciones_por_anio)
 
 
-############################################################
-# Se construyen los grafos no dirigidos y las redes
-############################################################
-vertices_df <- data.frame(name = trimws(as.character(nodos$name)))
+# Número de autores activos por año
+autores_por_anio <- df_bip_edges %>%
+  distinct(Author_id, Year) %>%
+  count(Year, name = "n_autores")
 
-graphs_year <- list()      # para tabla general
-networks_list <- list()    # para btergm
+print(autores_por_anio)
 
-for(y in 2010:2024){  # <-- cambié a 2010
-  df_y <- df_edges_year %>% 
-    filter(Year == y) %>%
-    select(from,to)
+
+# ============================================================
+# 4. CONSTRUCCIÓN TEMPORAL DEL UNIVERSO DE NODOS
+# ============================================================
+#
+# IMPORTANTE:
+#
+# En cada año t:
+#
+#   autores = autores que ya aparecieron hasta t
+#   papers  = publicaciones que ya aparecieron hasta t
+#
+# Por tanto:
+#
+#   V_t = A_(<=t) U P_(<=t)
+#
+# Esto evita introducir autores/papers futuros como aislados.
+# ============================================================
+
+years <- 2010:2024
+
+networks_bip <- list()
+
+for (y in years) {
   
-  g <- graph_from_data_frame(df_y, vertices=vertices_df, directed=FALSE)
-  graphs_year[[as.character(y)]] <- g
-  networks_list[[as.character(y)]] <- intergraph::asNetwork(g)
+  # ----------------------------------------------------------
+  # Nodos disponibles hasta el año y
+  # ----------------------------------------------------------
+  
+  authors_y <- df_bip_edges %>%
+    filter(Year <= y) %>%
+    distinct(Author_id) %>%
+    pull(Author_id)
+  
+  papers_y <- df_bip_edges %>%
+    filter(Year <= y) %>%
+    distinct(EID) %>%
+    pull(EID)
+  
+  
+  # ----------------------------------------------------------
+  # Universo de nodos del año
+  # ----------------------------------------------------------
+  
+  vertices_y <- data.frame(
+    name = c(authors_y, papers_y),
+    type = c(
+      rep("author", length(authors_y)),
+      rep("paper", length(papers_y))
+    ),
+    stringsAsFactors = FALSE
+  )
+  
+  
+  n_authors_y <- length(authors_y)
+  
+  
+  # ----------------------------------------------------------
+  # Inicializar red bipartita
+  # ----------------------------------------------------------
+  
+  net <- network.initialize(
+    n = nrow(vertices_y),
+    bipartite = n_authors_y,
+    directed = FALSE
+  )
+  
+  
+  set.vertex.attribute(
+    net,
+    "vertex.names",
+    vertices_y$name
+  )
+  
+  net %v% "type" <- vertices_y$type
+  
+  
+  # ----------------------------------------------------------
+  # Aristas DEL AÑO y
+  # ----------------------------------------------------------
+  
+  ed_y <- df_bip_edges %>%
+    filter(Year == y)
+  
+  
+  if (nrow(ed_y) > 0) {
+    
+    from_idx <- match(
+      ed_y$Author_id,
+      vertices_y$name
+    )
+    
+    to_idx <- match(
+      ed_y$EID,
+      vertices_y$name
+    )
+    
+    valid <- !is.na(from_idx) & !is.na(to_idx)
+    
+    if (any(valid)) {
+      
+      add.edges(
+        net,
+        tail = from_idx[valid],
+        head = to_idx[valid]
+      )
+    }
+  }
+  
+  
+  networks_bip[[as.character(y)]] <- net
+  
+  
+  # ----------------------------------------------------------
+  # Diagnóstico
+  # ----------------------------------------------------------
+  
+  n_authors_total <- sum(vertices_y$type == "author")
+  n_papers_total  <- sum(vertices_y$type == "paper")
+  
+  n_authors_active <- sum(
+    network.size(net) > 0 &
+      vertices_y$type == "author"
+  )
+  
+  cat(
+    "\nAño:", y,
+    "\n  Autores acumulados:", n_authors_total,
+    "\n  Papers acumulados:", n_papers_total,
+    "\n  Aristas:", network.edgecount(net),
+    "\n"
+  )
 }
 
-# GENERAL para tu descriptivo
-graphs_year[["GENERAL"]] <- graph_from_data_frame(
-  df_edges_year %>% distinct(from,to), vertices=vertices_df, directed=FALSE
-)
 
+# ============================================================
+# 5. ORDEN TEMPORAL PARA BTERGM
+# ============================================================
 
-############################################################
-# 1. TABLA GENERAL
-############################################################
-df_general <- lapply(names(graphs_year), function(y){
-  g <- graphs_year[[y]]
-  comp <- igraph::components(g)
-  deg <- igraph::degree(g)
-  data.frame(
-    Red = y,
-    N_nodos = igraph::vcount(g),
-    N_conectados = sum(deg>0),
-    N_aristas = igraph::ecount(g),
-    Grado_prom = round(mean(deg),2),
-    Grado_max = max(deg),
-    Densidad = igraph::edge_density(g),
-    N_componentes = comp$no,
-    Tam_comp_principal = max(comp$csize),
-    Prop_comp_principal = max(comp$csize)/igraph::vcount(g),
-    Clustering_global = igraph::transitivity(g, type="global"),
-    Aislados = sum(deg==0)
-  )
-}) %>% bind_rows()
-
-print(df_general)
-
-############################################################
-# GRÁFICOS EVOLUTIVOS
-############################################################
-df_plot <- df_general %>% filter(Red!="GENERAL") %>% mutate(Year=as.integer(as.character(Red)))
-
-ggplot(df_plot, aes(Year, N_aristas)) + geom_line() + geom_point() + theme_minimal() + labs(title="Evolución N° aristas")
-ggplot(df_plot, aes(Year, Grado_prom)) + geom_line() + geom_point() + theme_minimal() + labs(title="Grado promedio")
-ggplot(df_plot, aes(Year, Clustering_global)) + geom_line() + geom_point() + theme_minimal() + labs(title="Clustering global")
-ggplot(df_plot, aes(Year, Prop_comp_principal)) + geom_line() + geom_point() + theme_minimal() + labs(title="Proporción componente principal")
-
-
-# -------------------------------------------------
-# 0. Ventanas temporales
-# -------------------------------------------------
-# Memoria necesita t-1, por eso memoria empieza en 2010
-# Modelo estima 2011:2024 = 14 redes, 13 transiciones
 years_memoria <- 2010:2024
 years_modelo <- 2011:2024
 
-nets_ordered <- networks_list[as.character(years_memoria)]
-nets_modelo <- nets_ordered[as.character(years_modelo)]
-length(nets_modelo) # 14, no 13
+nets_bip_ordered <- networks_bip[
+  as.character(years_memoria)
+]
 
-# -------------------------------------------------
-# 1. Élite estática top 25% - definición teórica
-# -------------------------------------------------
-# Élite por producción acumulada, no flotante por año
-prod_total <- rowSums(produccion[, as.character(years_memoria)], na.rm = TRUE)
-names(prod_total) <- produccion$id_nodo
+nets_bip_modelo <- nets_bip_ordered[
+  as.character(years_modelo)
+]
 
-umbral_75 <- quantile(prod_total, 0.75, na.rm = TRUE)
-prod_alta_named <- as.numeric(prod_total >= umbral_75)
-names(prod_alta_named) <- produccion$id_nodo
+# ============================================================
+# 6. PRODUCTIVIDAD ACUMULADA
+# ============================================================
 
-# -------------------------------------------------
-# 2. Asignar atributos a cada red
-# -------------------------------------------------
-for(y in years_memoria){
-  net <- nets_ordered[[as.character(y)]]
-  idx <- match(vertices_df$name, produccion$id_nodo)
+prod_total <- rowSums(
+  produccion[, as.character(years_memoria)],
+  na.rm = TRUE
+)
+
+names(prod_total) <- as.character(produccion$id_nodo)
+
+
+# Top 25 %
+umbral_75 <- quantile(
+  prod_total,
+  0.75,
+  na.rm = TRUE
+)
+
+prod_alta_named <- as.numeric(
+  prod_total >= umbral_75
+)
+
+names(prod_alta_named) <- names(prod_total)
+
+
+# ============================================================
+# 7. ATRIBUTOS DE LOS AUTORES
+# ============================================================
+
+for (y in years_memoria) {
+  
+  net <- nets_bip_ordered[[as.character(y)]]
+  
+  vnames <- network.vertex.names(net)
+  
+  is_author <- net %v% "type" == "author"
+  
+  author_names <- vnames[is_author]
+  
+  
+  # ----------------------------------------------------------
+  # Productividad del año
+  # ----------------------------------------------------------
+  
+  idx <- match(
+    author_names,
+    as.character(produccion$id_nodo)
+  )
   
   prod_y <- produccion[[as.character(y)]][idx]
+  
   prod_y[is.na(prod_y)] <- 0
   
-  prod_alta_y <- prod_alta_named[idx]
+  
+  # ----------------------------------------------------------
+  # Indicador de alta productividad
+  # ----------------------------------------------------------
+  
+  prod_alta_y <- prod_alta_named[author_names]
+  
   prod_alta_y[is.na(prod_alta_y)] <- 0
   
-  net %v% "produccion" <- prod_y
-  net %v% "produccion_log" <- log1p(prod_y)
-  net %v% "prod_alta" <- prod_alta_y
   
-  nets_ordered[[as.character(y)]] <- net
+  # ----------------------------------------------------------
+  # Asignar atributos únicamente a autores
+  # ----------------------------------------------------------
+  
+  prod_full <- rep(NA_real_, network.size(net))
+  
+  prod_alta_full <- rep(NA_real_, network.size(net))
+  
+  
+  prod_full[is_author] <- prod_y
+  
+  prod_alta_full[is_author] <- prod_alta_y
+  
+  
+  net %v% "produccion" <- prod_full
+  
+  net %v% "prod_alta" <- prod_alta_full
+  
+  
+  nets_bip_ordered[[as.character(y)]] <- net
 }
-nets_modelo <- nets_ordered[as.character(years_modelo)]
 
-# -------------------------------------------------
-# 3. Diagnóstico Lotka / justificación isolates
-# -------------------------------------------------
-isolates_year <- sapply(nets_modelo, function(net) sum(degree(net, gmode="graph") == 0))
-isolates_year # ~2800 por año
 
-all_deg <- unlist(lapply(nets_modelo, function(net) degree(net, gmode="graph")))
-table(all_deg) # 36,799 en grado 0 + picos en 369, 391, 467, 500, 539 = tus masivas
+# Actualizar redes del modelo
+nets_bip_modelo <- nets_bip_ordered[
+  as.character(years_modelo)
+]
 
-# Justifica isolates, no gwdegree: Lotka es para ceros, no para curva 1/n2
 
-# -------------------------------------------------
-# 4. Control autoría masiva - 9 papers de tu foto
-# -------------------------------------------------
-# 540, 501, 474, 469, 468, 468, 423, 392, 370 autores
-# No se borran, se absorben con edgecov ponderado log
+# ============================================================
+# 8. COMPROBACIONES ANTES DEL BTERGM
+# ============================================================
 
-masiva_mat_list <- lapply(nets_modelo, function(net){
-  n <- network.size(net)
-  mat <- matrix(0, n, n)
-  deg <- degree(net, gmode="graph")
-  cand <- unique(deg[deg >= 125])
-  
-  for(d in cand){
-    idx <- which(deg == d)
-    if(length(idx) > 2){
-      sub <- as.matrix(net)[idx, idx]
-      if(sum(sub) == length(idx)*(length(idx)-1)){
-        # peso log: 370->0.82, 540->0.76, triada 3->1
-        # así beta queda ~30 y no 11835, y gwesp no se escapa a 221
-        w <- log(125) / log(length(idx))
-        mat[idx, idx] <- w
-      }
-    }
-  }
-  diag(mat) <- 0
-  mat
-})
+# Tamaño de las redes
+network_sizes <- data.frame(
+  Year = years,
+  Nodes = sapply(networks_bip, network.size),
+  Edges = sapply(networks_bip, network.edgecount)
+)
 
-# chequeo obligatorio antes de btergm
-stopifnot(length(masiva_mat_list) == length(nets_modelo)) # 14 == 14
-stopifnot(all(!sapply(masiva_mat_list, is.null)))
+print(network_sizes)
 
-# -------------------------------------------------
-# 5. Modelo final - H2 cierre estratificado neto de big science
-# -------------------------------------------------
+
+# Proporción de aislados
+isolated_stats <- data.frame(
+  Year = years,
+  Isolates = sapply(
+    networks_bip,
+    function(x) sum(network.size(x) > 0 & degree(x) == 0)
+  )
+)
+
+isolated_stats$Prop_isolates <-
+  isolated_stats$Isolates /
+  network_sizes$Nodes
+
+print(isolated_stats)
+
+
+# ============================================================
+# 9. MODELO BTERGM bipartito BASE
+# ============================================================
 set.seed(42)
 
-modelo_final_elite <- btergm(nets_modelo ~
-  edges + isolates +
-  edgecov(masiva_mat_list) +
-  gwesp(0.6, fixed=TRUE) +
-  nodefactor("prod_alta") + nodematch("prod_alta") +
-  memory(type="stability", lag=1), R=1000)
+m0_bip <- btergm(
+  nets_bip_modelo ~
+    edges +
+    gwb1degree(
+      0.6,
+      fixed = TRUE
+    ) +
+    gwb2degree(
+      0.6,
+      fixed = TRUE
+    ),
+  R = 1000
+)
 
 
-summary(modelo_final_elite)
+# ============================================================
+# 10. RESULTADOS
+# ============================================================
+summary(m0_bip)
+
+
+set.seed(42)
+
+m_final_bip <- btergm(
+  nets_bip_modelo ~
+    edges +
+    gwb1degree(0.6, fixed = TRUE) +
+    gwb2degree(0.6, fixed = TRUE) +
+    gwb1dsp(0.6, fixed = TRUE) +
+    b1factor("prod_alta") +
+    b1nodematch("prod_alta"),
+  R = 1000
+)
+
+summary(m_final_bip)
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
 

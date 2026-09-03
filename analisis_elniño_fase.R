@@ -18,9 +18,10 @@ cat("\014")
   #"lubridate",
   #"scales"
 #))
-
 #install.packages("intergraph")
 #install.packages("speedglm")
+#install.packages("bipartite")
+
 
 # Se cargan las librerias que serán utilizadas
 library(tidyverse)
@@ -42,12 +43,16 @@ library(ergm)
 library(btergm)
 library(intergraph)
 library(speedglm)
+library(igraph)
+library(bipartite)
+library(knitr)
 
-# Se define el directorio de forma manual
+
+# Se define el directorio de forma manual y formal
 setwd("C:/Users/Enzo/OneDrive/Documentos/Trabajo Banco Mundial/proyecto_fenomeno_nino")
 getwd()
 
-# Se cargan los dos archivos que serán usados
+# Se cargan los tres archivos que serán usados
 nodos <- read_csv("authors.csv")
 autor_publicacion <- read_csv("author_publication.csv")
 produccion <- read_csv("produccion_cientifica.csv")
@@ -70,11 +75,10 @@ autor_publicacion <- autor_publicacion %>%
     Year = as.integer(Year)
   )
 
+# Se observa un caso particular en el dataframe autor_publicacion
+View(autor_publicacion %>% filter (Author_id == "58787423400"))
 
-# ============================================================
-# 2. RED BIPARTITA AUTOR–PUBLICACIÓN
-# ============================================================
-
+# Se construye una red bipartita de autores científicos y publicaciones 
 df_bip_edges <- autor_publicacion %>%
   filter(
     !is.na(Author_id),
@@ -85,18 +89,18 @@ df_bip_edges <- autor_publicacion %>%
   ) %>%
   distinct(Author_id, EID, Year)
 
+class(df_bip_edges)
 
-# ============================================================
-# 3. DIAGNÓSTICOS
-# ============================================================
-
-# ¿Un EID aparece asociado a más de un año?
-eid_multiple_years <- df_bip_edges %>%
+# Se calcula la producción científica anual
+publicaciones_por_anio <- df_bip_edges %>%
   distinct(EID, Year) %>%
-  count(EID, name = "n_years") %>%
-  filter(n_years > 1)
+  count(Year, name = "n_publicaciones")
 
-print(eid_multiple_years)
+print(publicaciones_por_anio)
+
+# Se calcula producción científica total
+suma_total_publicaciones <- sum(publicaciones_por_anio$n_publicaciones)
+print(suma_total_publicaciones)
 
 
 # Número de autores por publicación
@@ -107,21 +111,124 @@ autores_por_publicacion <- df_bip_edges %>%
 
 print(head(autores_por_publicacion, 20))
 
+# Numero de autores únicos por año
+autores_por_anio <- df_bip_edges %>%
+  distinct(Author_id, Year) %>%
+  count(Year, name = "n_autores_unicos")
 
-# Número de publicaciones por año
-publicaciones_por_anio <- df_bip_edges %>%
+print(autores_por_anio)
+
+
+################################################################################
+# Se calcula la cantidad de publicaciones con autoria masiva por año
+# Definir el umbral (cámbielo según su criterio o campo de estudio)
+################################################################################
+umbral_masivo <- 120
+
+# Calcular publicaciones masivas por año
+publicaciones_masivas <- df_bip_edges %>%
+  group_by(Year, EID) %>%
+  summarise(total_autores = n(), .groups = "drop") %>%
+  mutate(es_masiva = total_autores >= umbral_masivo) %>%
+  group_by(Year) %>%
+  summarise(
+    total_publicaciones = n(),
+    publicaciones_masivas = sum(es_masiva),
+    porcentaje_masivas = (publicaciones_masivas / total_publicaciones) * 100
+  )
+
+print(publicaciones_masivas)
+
+sum(publicaciones_masivas$publicaciones_masivas) / sum(publicaciones_masivas$total_publicaciones) # 10 / 443 = 2.25%
+
+################################################################################
+# Se calcula el número de autores por cada paper de autoria masiva por año
+################################################################################
+
+autores_por_paper <- df_bip_edges %>%
+  group_by(Year, EID) %>%
+  summarise(n_autores = n_distinct(Author_id), .groups="drop")
+
+# 2. define masiva - pon tu corte real, ej 100 autores
+corte_masiva <- 120
+
+masivas <- autores_por_paper %>%
+  filter(n_autores >= corte_masiva) %>%
+  arrange(Year, desc(n_autores))
+
+masivas
+
+################################################################################
+# Calcular el total de enlaces únicos (autor-publicación) por año
+################################################################################
+
+enlaces_por_anio <- df_bip_edges %>%
+  count(Year, name = "total_enlaces")
+
+# Visualizar el resultado
+print(enlaces_por_anio)
+
+################################################################################
+# ¿Un EID aparece asociado a más de un año?
+################################################################################
+
+eid_multiple_years <- df_bip_edges %>%
   distinct(EID, Year) %>%
-  count(Year, name = "n_publicaciones")
+  count(EID, name = "n_years") %>%
+  filter(n_years > 1)
 
-print(publicaciones_por_anio)
+print(eid_multiple_years)
 
-
+################################################################################
 # Número de autores activos por año
+################################################################################
+
 autores_por_anio <- df_bip_edges %>%
   distinct(Author_id, Year) %>%
   count(Year, name = "n_autores")
 
 print(autores_por_anio)
+
+################################################################################
+# Se crea un objeto graph bipartito usando el dataframe df_bip_edges
+################################################################################
+
+g <- graph_from_data_frame(df_bip_edges[,c("EID","Author_id")], directed=FALSE)
+V(g)$type <- V(g)$name %in% df_bip_edges$Author_id
+is_bipartite(g) # TRUE
+class(g)
+
+
+# 1. Básico global
+n_papers <- sum(!V(g)$type)
+n_autores <- sum(V(g)$type)
+
+M <- as_biadjacency_matrix(g) # necesitas esto para bipartite
+
+################################################################################
+# 2. Nivel de densidad de la red
+################################################################################
+densidad_bip <- ecount(g) / (n_papers * n_autores)
+print(densidad_bip)
+
+################################################################################
+# Se analizan descriptivos de la matriz biadyacente
+################################################################################
+
+bipartite::networklevel(M_dense, index=c("connectance","web asymmetry","nestedness","ISA"))
+
+tab <- data.frame(
+  Indice = c("Connectance", "Web asymmetry", "Nestedness", "Interaction Strength Asymmetry"),
+  Valor = c(0.00503, 0.7466, 0.1617, 0.0000),
+  Interpretacion = c(
+    "Red hiper-dispersa (0.5% de enlaces posibles)",
+    "Fuerte desbalance: muchos más autores que papers",
+    "Baja anidación: sin núcleo-periferia claro",
+    "Red no pesada (matriz binaria)"
+  )
+)
+
+kable(tab, digits=4, caption="Descriptivos de la matriz biadyacente [papers x autores]")
 
 
 # ============================================================
@@ -421,7 +528,7 @@ m0_bip <- btergm(
 # ============================================================
 summary(m0_bip)
 
-
+# Se elabora el modelo final
 set.seed(42)
 
 m_final_bip <- btergm(
@@ -432,11 +539,119 @@ m_final_bip <- btergm(
     gwb1dsp(0.6, fixed = TRUE) +
     b1factor("prod_alta") +
     b1nodematch("prod_alta"),
-  R = 1000
+  R = 5000
 )
 
 summary(m_final_bip)
 
+gof_bip <- btergm::gof(m_final_bip, nsim = 100)
+plot(gof_bip)
 
+
+
+
+
+
+
+
+
+
+
+
+
+library(dplyr)
+library(purrr)
+
+# ============================================================
+# 1. AUTORES DE CADA PUBLICACIÓN
+# ============================================================
+
+equipos <- autor_publicacion %>%
+  mutate(
+    Author_id = trimws(as.character(Author_id)),
+    EID = trimws(as.character(EID)),
+    Year = as.integer(Year)
+  ) %>%
+  filter(
+    !is.na(Author_id),
+    !is.na(EID),
+    !is.na(Year),
+    Year >= 2010,
+    Year <= 2024
+  ) %>%
+  distinct(Year, EID, Author_id) %>%
+  group_by(Year, EID) %>%
+  summarise(
+    autores = list(unique(Author_id)),
+    n_autores = n_distinct(Author_id),
+    .groups = "drop"
+  )
+
+
+# ============================================================
+# 2. COMPARAR CADA PUBLICACIÓN DE t CON LAS DE t+1
+# ============================================================
+
+persistencia <- equipos %>%
+  rename(
+    year_t = Year,
+    eid_t = EID,
+    autores_t = autores,
+    n_autores_t = n_autores
+  ) %>%
+  left_join(
+    equipos %>%
+      rename(
+        year_t1 = Year,
+        eid_t1 = EID,
+        autores_t1 = autores,
+        n_autores_t1 = n_autores
+      ),
+    by = character()
+  ) %>%
+  filter(year_t1 == year_t + 1) %>%
+  mutate(
+    autores_comunes = map2_int(
+      autores_t,
+      autores_t1,
+      ~ length(intersect(.x, .y))
+    ),
+    
+    proporcion_persistencia =
+      autores_comunes / n_autores_t
+  )
+
+
+# ============================================================
+# 3. ELEGIR LA PUBLICACIÓN DE t+1 CON MAYOR SOLAPAMIENTO
+# ============================================================
+
+persistencia_max <- persistencia %>%
+  group_by(year_t, eid_t) %>%
+  slice_max(
+    order_by = proporcion_persistencia,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+
+# ============================================================
+# 4. RESULTADOS
+# ============================================================
+
+resultado <- persistencia_max %>%
+  dplyr::select(
+    year_t,
+    eid_t,
+    n_autores_t,
+    eid_t1,
+    n_autores_t1,
+    autores_comunes,
+    proporcion_persistencia
+  ) %>%
+  arrange(year_t, desc(proporcion_persistencia))
+
+print(resultado)
 
 

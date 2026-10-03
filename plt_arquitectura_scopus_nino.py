@@ -232,16 +232,9 @@ df_autor_publicacion.to_csv(
 )
 
 
-# Con el propósito de construir asociaciones entre autores y publicaciones, en línea con las ventanas
-# históricas de publicación, debo eliminar los años 2010, 2011 y 2012
-
-años_a_eliminar = [2010, 2011, 2012] # ajusta según lo que necesites excluir
-df_autor_publicacion_x = df_autor_publicacion[~df_autor_publicacion["Year"].isin(años_a_eliminar)].reset_index(drop=True)
-
-
-# Se construye una tabla que muestra la distribución de autores por publicación científica
+# Se construye una tabla que muestra la distribución de autores por publicacion
 tabla_publicaciones = (
-    df_autor_publicacion_x.groupby("EID")["Author_id"]
+    df_autor_publicacion.groupby("EID")["Author_id"]
     .nunique()
     .reset_index(name="Total_autores")
     .sort_values("Total_autores", ascending=False)
@@ -252,56 +245,185 @@ print("\nTabla de autores por publicación:")
 print(tabla_publicaciones.head(20))
 
 
-# Se elabora un histrograma de frecuencias
-plt.figure(figsize=(8, 5))
-plt.hist(
-    tabla_publicaciones["Total_autores"],
-    bins=range(1, tabla_publicaciones["Total_autores"].max() + 2),
-    edgecolor="black",
-    align="left"
-)
-plt.xlabel("Número de autores")
-plt.ylabel("Número de publicaciones")
-plt.title("Distribución del número de autores por publicaciones")
-plt.tight_layout()
+plt.figure()
+plt.hist(tabla_publicaciones["Total_autores"].astype(float), bins=30)
+plt.xlabel("N autores")
+plt.ylabel("N publicaciones")
+plt.title("Histograma productividad")
+plt.show()
 
 
+# El despliegue de esta tabla permite identificar la existencia de publicaciones científica con autoria masiva
+# Estas publicaciones representan alrededor del 2% del total de publicaciones
+# Una proporción enorme de tu red de autores existe únicamente por su participación en publicaciones de autoría masiva (41%)
 
-# Se construye una tabla que muestra la distribución de publicaciones científicas por investigador
-tabla_publicaciones = (
-    df_autor_publicacion_x.groupby("Author_id")["EID"]
+
+# Se construye una tabla que expone la distribución de publicaciones por autor (Modo 1)
+tabla_autores = (
+    df_autor_publicacion.groupby("Author_id")["EID"]
     .nunique()
     .reset_index(name="Total_publicaciones")
-    .sort_values("Total_publicaciones", ascending=False)
+    .sort_values("Total_publicaciones", ascending = False)
+    .reset_index(drop=True)
+    )
+
+plt.figure()
+plt.hist(tabla_autores["Total_publicaciones"].astype(float), bins=30)
+plt.xlabel("N publicaciones")
+plt.ylabel("N autores")
+plt.title("Histograma productividad")
+plt.show()
+
+# Alrededor del 75% de los autores solo cuentan con una publicación científica
+
+###############################################################################
+# Se analizan algunos resultados
+###############################################################################
+caso = df_autor_publicacion[df_autor_publicacion["Author_id"]=="6602402405"]
+caso = investiga[investiga["EID"]=="2-s2.0-84910080574"]
+
+
+
+
+# Para corregir o tratar la presencia de las publicaciones con autoria masiva, debo utilizar un mecanismo de conteo fraccionado de productividad
+
+"""
+Conteo fraccionado de productividad por autor + histograma
+-------------------------------------------------------------
+Input esperado: df_autores con columnas EID, Year, Author_id
+(formato largo: una fila por par autor-publicación)
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# -----------------------------------------------------------------
+# 1. Punto de partida: df_autores (EID, Year, Author_id)
+# -----------------------------------------------------------------
+
+# -----------------------------------------------------------------
+# 2. Tamaño de equipo por publicación (número de autores por EID)
+# -----------------------------------------------------------------
+tamano_equipo = (
+    df_autores.groupby("EID")["Author_id"]
+    .nunique()
+    .reset_index(name="Total_autores")
+)
+
+print("Publicaciones con autoría masiva (top 10):")
+print(tamano_equipo.sort_values("Total_autores", ascending=False).head(10))
+
+# -----------------------------------------------------------------
+# 3. Crédito fraccionado por fila: 1 / Total_autores de esa publicación
+# -----------------------------------------------------------------
+df_autores_credito = df_autores.merge(tamano_equipo, on="EID", how="left")
+df_autores_credito["credito_fraccionado"] = 1 / df_autores_credito["Total_autores"]
+
+# Solo 20 publicaciones científicas cuentan con 1 autor durante el periodo de análisis
+
+
+# -----------------------------------------------------------------
+# 4. Productividad fraccionada por autor (suma de créditos a través de todas sus publicaciones)
+# -----------------------------------------------------------------
+productividad_fraccionada = (
+    df_autores_credito.groupby("Author_id")["credito_fraccionado"]
+    .sum()
+    .reset_index(name="productividad_fraccionada")
+    .sort_values("productividad_fraccionada", ascending=False)
     .reset_index(drop=True)
 )
- 
-print("\nTabla de publicaciones por autor:")
-print(tabla_publicaciones.head(20))
 
-# Se elabora un histrograma de frecuencias
-plt.figure(figsize=(8, 5))
-plt.hist(
-    tabla_publicaciones["Total_publicaciones"],
-    bins=range(1, tabla_publicaciones["Total_publicaciones"].max() + 2),
-    edgecolor="black",
-    align="left"
+# -----------------------------------------------------------------
+# 5. Comparación de referencia: productividad con conteo completo (para contraste)
+# -----------------------------------------------------------------
+productividad_completa = (
+    df_autores.groupby("Author_id")["EID"]
+    .nunique()
+    .reset_index(name="productividad_completa")
 )
-plt.xlabel("Número de publicaciones")
-plt.ylabel("Número de autores")
-plt.title("Distribución del número de publicaciones por autor")
-plt.tight_layout()
+
+comparacion = productividad_fraccionada.merge(productividad_completa, on="Author_id")
+
+print("\nTabla de productividad fraccionada (top 15):")
+print(comparacion.sort_values("productividad_fraccionada", ascending=False).head(15))
+
+print("\nEstadísticos descriptivos -- conteo completo:")
+print(comparacion["productividad_completa"].describe())
+
+print("\nEstadísticos descriptivos -- conteo fraccionado:")
+print(comparacion["productividad_fraccionada"].describe())
+
+# Guardar tablas
+comparacion.to_csv("/mnt/user-data/outputs/productividad_fraccionada_vs_completa.csv", index=False)
+
+# -----------------------------------------------------------------
+# 6. Histograma -- conteo COMPLETO (referencia, variable discreta)
+# -----------------------------------------------------------------
+plt.figure()
+plt.hist(comparacion["productividad_completa"].astype(float), bins=30)
+plt.xlabel("productividad_completa")
+plt.ylabel("n autores")
+plt.title("Histograma productividad completa")
+plt.show()
 
 
+# Histograma para la productividad fraccionada
+plt.figure()
+plt.hist(comparacion["productividad_fraccionada"].astype(float), bins=30)
+plt.xlabel("productividad_fraccionada")
+plt.ylabel("n autores")
+plt.title("Histograma productividad fraccionada")
+plt.show()
+
+# versión que te sirve para tesis - con log
+plt.figure()
+plt.hist(comparacion["productividad_fraccionada"].astype(float), bins=30, log=True)
+plt.xlabel("productividad_fraccionada")
+plt.ylabel("Log (N de autores)")
+plt.title("Histograma productividad fraccionada - escala log")
+plt.show()
+
+
+# Versión 1: conteo fraccionado (ya la tienes)
+prop_baja_frac = (comparacion["productividad_fraccionada"] < 0.5).mean()
+
+# Versión 2: excluyendo mega-papers (define un umbral, ej. 50+ autores)
+umbral = 50
+eids_excluir = tamano_equipo[tamano_equipo["Total_autores"] > umbral]["EID"]
+df_sin_mega = df_autores[~df_autores["EID"].isin(eids_excluir)]
+
+productividad_sin_mega = (
+    df_sin_mega.groupby("Author_id")["EID"]
+    .nunique()
+    .reset_index(name="Total_publicaciones")
+)
+prop_baja_exclusion = (productividad_sin_mega["Total_publicaciones"] == 1).mean()
+
+
+# Criterio equivalente: productividad == 1 en AMBAS versiones (sin fraccionar todavía)
+prop_1pub_original = (productividad_completa["productividad_completa"] == 1).mean()
+prop_1pub_sin_mega = (productividad_sin_mega["Total_publicaciones"] == 1).mean()
+
+print(f"Proporción con 1 publicación -- dataset ORIGINAL completo: {prop_1pub_original:.2%}")
+print(f"Proporción con 1 publicación -- tras EXCLUSIÓN de mega-papers: {prop_1pub_sin_mega:.2%}")
+
+
+# Se elabora una covariante nodal asociada con la productividad científica completa
+# df_autor_credito tiene Author_id, Year, credito_fraccionado
+# Productividad del año t - para POOLED sin lag
 df_dinamico = (
-    df_autor_publicacion_x.groupby(["Author_id","Year"]).size()
-    .reindex(pd.MultiIndex.from_product([df_nodos['Author_id'], range(2010,2025)], names=['id_nodo','anio']), fill_value=0)
-    .groupby(level=0).cumsum()      # acumulado
-    .groupby(level=0).shift(1)      # lag t-1
-    .fillna(0).astype(int)
-    .unstack(level=1)               # ancho: nodos x años
+    df_autores_credito.groupby(["Author_id","Year"])["credito_fraccionado"].sum()
+   .reindex(pd.MultiIndex.from_product(
+        [df_nodos['Author_id'], range(2010,2025)],
+        names=['id_nodo','anio']), fill_value=0)
+   .unstack(level=1, fill_value=0)
+   .reset_index()
 )
-df_dinamico.reset_index(inplace=True)
+
+# Ver 2010 con valores > 0
+df_dinamico[df_dinamico[2010] > 0][['id_nodo', 2010]].head(10)
 
 # Guardar tabla de covariante nodal asociada con la producción científica con rezago considerando el periodo 2013 - 2024
 df_dinamico.to_csv(
@@ -309,17 +431,6 @@ df_dinamico.to_csv(
     index=False,
     encoding="utf-8-sig"
 )
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -349,7 +460,31 @@ investiga1.rename(columns=({"EID":"eid"}), inplace=True)
 fusion2 = pd.merge(fusion, investiga1, on="eid", how="right")
 fusion2["eid"].nunique()
 fusion2["auth_id"] = fusion2["auth_id"].apply(lambda x: str(x))
-4
+fusion2.columns
+
+
+# Considerando fusion2 se crea un dataframe con solo autores y sus afiliaciones
+fusion3 = fusion2[["auth_id", "auth_name", "affil_name", "affiliation_country"]]
+fusion3 = fusion3.drop_duplicates(subset=["auth_name"])
+                        
+
+# Se carga un archivo compartido por R
+def int_to_str(value):
+    return str(value)
+
+# Especifica el diccionario de conversión en el parámetro converters
+converters = {"Author_id": int_to_str}
+
+investigador_r = pd.read_excel("autores_recurrentes_gwb1dsp.xlsx", sheet_name="Autores_Recurrentes_IDs", header=0, converters=converters)
+investigador_r.rename(columns=({"Author_id":"auth_id"}), inplace=True)
+
+# Se fusion f4
+f4 = pd.merge(investigador_r, fusion3, on="auth_id", how="left")
+
+
+
+
+
 
 
 
